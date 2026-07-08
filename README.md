@@ -67,13 +67,31 @@ tenable-tie-mcp --transport sse --port 8000
 tenable-tie-mcp --transport http --port 8000
 ```
 
-### Claude Desktop / Claude Code config
+### Running with uv / uvx (alternative to a manual venv)
+
+[uv](https://docs.astral.sh/uv/) can manage the environment for you. `uv` is the
+full tool; `uvx` (alias for `uv tool run`) runs a package in a throwaway env, like
+`npx`. Both need `uv` installed (`brew install uv`).
+
+```bash
+# uv run: resolves deps from pyproject.toml into a managed .venv, then runs
+uv run tenable-tie-mcp
+
+# uvx: run ephemerally from the project path, nothing persisted
+uvx --from . tenable-tie-mcp
+```
+
+## Claude Desktop config with uv
+
+Point `command` at the **full path** of `uv` (`which uv`, e.g. `/opt/homebrew/bin/uv`)
+and let it manage the environment:
 
 ```json
 {
   "mcpServers": {
     "tenable-tie": {
-      "command": "tenable-tie-mcp",
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["run", "--directory", "/absolute/path/to/tenable-ie-mcp", "tenable-tie-mcp"],
       "env": {
         "TIE_URL": "https://your-host.tenable.ad",
         "TIE_API_KEY": "your-key"
@@ -82,6 +100,34 @@ tenable-tie-mcp --transport http --port 8000
   }
 }
 ```
+
+### Claude Desktop / Claude Code config
+
+Use the **full path** to the executable. Claude Desktop does not launch from your
+shell, so it does not inherit your `PATH` — a bare `tenable-tie-mcp` will fail with
+"command not found" unless the tool is on the system PATH (e.g. a `pipx` install).
+
+For a venv install, point at the venv's launcher:
+
+```json
+{
+  "mcpServers": {
+    "tenable-tie": {
+      "command": "/absolute/path/to/tenable-ie-mcp/.venv/bin/tenable-tie-mcp",
+      "env": {
+        "TIE_URL": "https://your-host.tenable.ad",
+        "TIE_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
+
+Find the exact path with `echo "$PWD/.venv/bin/tenable-tie-mcp"` from the project
+root. See `claude_desktop_config.sample.json` for a complete example.
+
+> If you installed globally with `pipx install .` (or `uv tool install`), the bare
+> `"command": "tenable-tie-mcp"` works because it lands on the system PATH.
 
 ## Docker
 
