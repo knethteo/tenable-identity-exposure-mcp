@@ -81,27 +81,7 @@ uv run tenable-tie-mcp
 uvx --from . tenable-tie-mcp
 ```
 
-## Claude Desktop config with uv
-
-Point `command` at the **full path** of `uv` (`which uv`, e.g. `/opt/homebrew/bin/uv`)
-and let it manage the environment:
-
-```json
-{
-  "mcpServers": {
-    "tenable-tie": {
-      "command": "/opt/homebrew/bin/uv",
-      "args": ["run", "--directory", "/absolute/path/to/tenable-ie-mcp", "tenable-tie-mcp"],
-      "env": {
-        "TIE_URL": "https://your-host.tenable.ad",
-        "TIE_API_KEY": "your-key"
-      }
-    }
-  }
-}
-```
-
-### Claude Desktop / Claude Code config
+## Claude Desktop / Claude Code config
 
 Use the **full path** to the executable. Claude Desktop does not launch from your
 shell, so it does not inherit your `PATH` — a bare `tenable-tie-mcp` will fail with
@@ -128,6 +108,26 @@ root. See `claude_desktop_config.sample.json` for a complete example.
 
 > If you installed globally with `pipx install .` (or `uv tool install`), the bare
 > `"command": "tenable-tie-mcp"` works because it lands on the system PATH.
+
+### With uv (alternative)
+
+Point `command` at the **full path** of `uv` (`which uv`, e.g. `/opt/homebrew/bin/uv`)
+and let it manage the environment:
+
+```json
+{
+  "mcpServers": {
+    "tenable-tie": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["run", "--directory", "/absolute/path/to/tenable-ie-mcp", "tenable-tie-mcp"],
+      "env": {
+        "TIE_URL": "https://your-host.tenable.ad",
+        "TIE_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
 
 ## Docker
 
