@@ -1,0 +1,684 @@
+"""Tenable Identity Exposure MCP Server."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from typing import Any, Literal
+
+import structlog
+from mcp.server.fastmcp import FastMCP
+
+from .catalog import TIE_RESOURCES, catalog_as_text
+from .client import TIEApiError, TIEClient, TIEConfig, TIEConfigError
+from .util import iso_utc, parse_iso, render_description, resolve_window, slim_list, slim_object
+
+log = structlog.get_logger(__name__)
+
+mcp = FastMCP(
+    "tenable-tie-mcp",
+    instructions=(
+        "Direct MCP interface for Tenable Identity Exposure (TIE). "
+        "Use tie_catalog to discover available resources. "
+        "Use tie_request for raw API calls or tie_resource_action for CRUD operations. "
+        "All API permissions are enforced by the configured API key."
+    ),
+)
+
+_client: TIEClient | None = None
+
+
+def get_client() -> TIEClient:
+    if _client is None:
+        raise RuntimeError("TIE client not initialized. Check TIE_URL and TIE_API_KEY env vars.")
+    return _client
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def tie_catalog() -> str:
+    """List all available Tenable Identity Exposure API resources and their paths.
+
+    Call this first to discover what resources exist before using other tools.
+    """
+    return catalog_as_text()
+
+
+@mcp.tool()
+async def tie_request(
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"],
+    path: str,
+    params: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+) -> Any:
+    """Make a direct HTTP call to any Tenable Identity Exposure API endpoint.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, PATCH, DELETE).
+        path: API path, e.g. "/api/directories" or "/api/attacks/123".
+        params: Optional query string parameters as a dict.
+        body: Optional request body as a dict (used with POST/PUT/PATCH).
+
+    Returns:
+        Parsed JSON response from the TIE API.
+    """
+    client = get_client()
+    try:
+        return await client.request(method, path, params=params, json=body)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_resource_action(
+    resource: str,
+    action: Literal["list", "get", "create", "update", "delete"] = "list",
+    id: int | str | None = None,
+    body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Perform CRUD operations on a TIE resource.
+
+    Args:
+        resource: Resource name from tie_catalog (e.g. "directories", "attacks", "users").
+        action: Operation — list, get, create, update, or delete.
+        id: Resource ID for get/update/delete operations.
+        body: Request body for create/update operations.
+        params: Optional query parameters (e.g. pagination, filters).
+
+    Examples:
+        List all directories:      resource="directories", action="list"
+        Get directory #5:          resource="directories", action="get", id=5
+        List recent attacks:       resource="attacks", action="list", params={"page": 1}
+        Create a user:             resource="users", action="create", body={...}
+        Delete an alert:           resource="alerts", action="delete", id=42
+    """
+    client = get_client()
+
+    entry = TIE_RESOURCES.get(resource)
+    if entry is None:
+        available = ", ".join(sorted(TIE_RESOURCES.keys()))
+        return {"error": f"Unknown resource '{resource}'. Available: {available}"}
+
+    base_path, supports_id, _ = entry
+
+    method: str
+    path: str
+
+    match action:
+        case "list":
+            method, path = "GET", base_path
+        case "get":
+            if id is None:
+                return {"error": "action='get' requires an id"}
+            if not supports_id:
+                return {"error": f"Resource '{resource}' does not support get-by-id"}
+            method, path = "GET", f"{base_path}/{id}"
+        case "create":
+            method, path = "POST", base_path
+        case "update":
+            if not supports_id:
+                # Singleton config resources (e.g. application-settings) PATCH the base path.
+                method, path = "PATCH", base_path
+            elif id is None:
+                return {"error": "action='update' requires an id for this resource"}
+            else:
+                method, path = "PATCH", f"{base_path}/{id}"
+        case "delete":
+            if id is None:
+                return {"error": "action='delete' requires an id"}
+            method, path = "DELETE", f"{base_path}/{id}"
+        case _:
+            return {"error": f"Unknown action '{action}'. Use: list, get, create, update, delete"}
+
+    try:
+        return await client.request(method, path, params=params, json=body)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_deviances_by_checker(
+    checker_id: int,
+    profile_id: int = 1,
+    page: int = 1,
+    per_page: int = 50,
+    expression: dict[str, Any] | None = None,
+    verbose: bool = False,
+) -> Any:
+    """List IoE deviances for a given checker within a profile (full detail, no date filter).
+
+    For a time-bounded view use tie_deviances(hours=...) or tie_recent_activity instead.
+    The TIE API models this as a POST with a filter `expression` body; an empty
+    expression returns all deviances for the checker.
+
+    Args:
+        checker_id: IoE checker id (see tie_resource_action resource="checkers").
+        profile_id: Security profile id (default 1).
+        page: Page number (1-based).
+        per_page: Results per page.
+        expression: Optional filter expression object. Defaults to {} (no filter).
+        verbose: If False (default), render descriptions and drop giant attribute
+            values to save tokens. Set True for the full raw payload.
+    """
+    client = get_client()
+    params: dict[str, Any] = {"page": page, "perPage": per_page}
+    body = {"expression": expression if expression is not None else {}}
+    path = f"/api/profiles/{profile_id}/checkers/{checker_id}/deviances"
+    try:
+        return slim_list(await client.request("POST", path, params=params, json=body), verbose)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_deviances_by_directory(
+    infrastructure_id: int,
+    directory_id: int,
+    page: int = 1,
+    per_page: int = 50,
+    verbose: bool = False,
+) -> Any:
+    """List IoE deviances for a specific directory (full detail, no date filter).
+
+    Args:
+        infrastructure_id: Infrastructure (forest) id — see resource="infrastructures".
+        directory_id: Directory id — see resource="directories".
+        page: Page number (1-based).
+        per_page: Results per page.
+        verbose: If False (default), render descriptions and drop giant attribute values.
+    """
+    client = get_client()
+    params = {"page": page, "perPage": per_page}
+    path = f"/api/infrastructures/{infrastructure_id}/directories/{directory_id}/deviances"
+    try:
+        return slim_list(await client.get(path, params=params), verbose)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_deviances(
+    checker_id: int,
+    profile_id: int = 1,
+    directory_ids: list[int] | None = None,
+    hours: float | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    reasons: list[int] | None = None,
+    show_ignored: bool = False,
+    page: int = 1,
+    per_page: int = 50,
+    verbose: bool = False,
+) -> Any:
+    """Find AD objects with IoE deviances for a checker within a time window.
+
+    This is the time-filterable deviance query (server-side dateStart/dateEnd via
+    the checker's ad-objects/search endpoint). Provide `hours` for a relative
+    window (e.g. hours=12) or explicit date_start/date_end. With neither, defaults
+    to the last 24h.
+
+    Args:
+        checker_id: IoE checker id (see resource="checkers").
+        profile_id: Security profile id (default 1). Note: your console may use a
+            non-default profile — call tie_profiles to list them.
+        directory_ids: Restrict to these directory ids (default: all directories in scope).
+        hours: Relative look-back window in hours (e.g. 12). Ignored if date_start given.
+        date_start: Explicit ISO 8601 UTC start (e.g. "2026-07-07T16:00:00.000Z").
+        date_end: Explicit ISO 8601 UTC end (default: now).
+        reasons: Optional reason ids to filter (see /api/profiles/{id}/checkers/{id}/reasons).
+        show_ignored: Include deviances that are currently ignored (default False).
+        page: Page number (1-based).
+        per_page: Results per page.
+        verbose: If False (default), truncate giant attribute values.
+    """
+    client = get_client()
+    start, end = resolve_window(hours, date_start, date_end)
+
+    dirs = directory_ids
+    if dirs is None:
+        try:
+            listing = await client.get("/api/directories")
+            dirs = [d["id"] for d in listing if isinstance(d, dict) and "id" in d]
+        except TIEApiError as exc:
+            return {"error": f"could not resolve directories: {exc}", "status": exc.status}
+
+    body: dict[str, Any] = {
+        "expression": {},
+        "directories": dirs,
+        "reasons": reasons if reasons is not None else [],
+        "showIgnored": show_ignored,
+        "dateStart": iso_utc(start),
+        "dateEnd": iso_utc(end),
+    }
+    params = {"page": page, "perPage": per_page}
+    path = f"/api/profiles/{profile_id}/checkers/{checker_id}/ad-objects/search"
+    try:
+        results = await client.request("POST", path, params=params, json=body)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+    items = results if isinstance(results, list) else results
+    return {
+        "window": {"start": iso_utc(start), "end": iso_utc(end), "timezone": "UTC"},
+        "profileId": profile_id,
+        "checkerId": checker_id,
+        "count": len(items) if isinstance(items, list) else None,
+        "objects": slim_list(items, verbose),
+    }
+
+
+@mcp.tool()
+async def tie_attacks(
+    resource_type: Literal["infrastructure", "directory", "hostname", "ip"],
+    resource_value: str,
+    profile_id: int = 1,
+    attack_type_ids: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    include_closed: bool = False,
+    limit: int = 50,
+    order: Literal["asc", "desc"] = "desc",
+    search: str | None = None,
+) -> Any:
+    """List IoA attack instances for a resource within a profile.
+
+    The TIE API requires scoping attacks to a resource. For example, to see
+    attacks against directory id 8: resource_type="directory", resource_value="8".
+
+    Args:
+        resource_type: What resource_value refers to — infrastructure, directory, hostname, or ip.
+        resource_value: The id (for infrastructure/directory) or name/ip value to scope to.
+        profile_id: Security profile id (default 1).
+        attack_type_ids: Optional list of attack type ids to filter (e.g. DCSync, Kerberoasting).
+        date_start: Optional ISO 8601 start of date range.
+        date_end: Optional ISO 8601 end of date range.
+        include_closed: Include closed attacks (default False).
+        limit: Max results (default 50).
+        order: Sort order by date, "desc" (newest first) or "asc".
+        search: Optional free-text search filter.
+    """
+    client = get_client()
+    params: dict[str, Any] = {
+        "resourceType": resource_type,
+        "resourceValue": resource_value,
+        "includeClosed": "true" if include_closed else "false",
+        "limit": limit,
+        "order": order,
+    }
+    if attack_type_ids:
+        params["attackTypeIds"] = attack_type_ids
+    if date_start:
+        params["dateStart"] = date_start
+    if date_end:
+        params["dateEnd"] = date_end
+    if search:
+        params["search"] = search
+    try:
+        return await client.get(f"/api/profiles/{profile_id}/attacks", params=params)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_alerts(
+    profile_id: int = 1,
+    page: int = 1,
+    per_page: int = 50,
+    archived: bool | None = None,
+) -> Any:
+    """List alerts for a security profile.
+
+    Args:
+        profile_id: Security profile id (default 1).
+        page: Page number (1-based).
+        per_page: Results per page.
+        archived: Optionally filter by archived status (True/False).
+    """
+    client = get_client()
+    params: dict[str, Any] = {"page": page, "perPage": per_page}
+    if archived is not None:
+        params["archived"] = "true" if archived else "false"
+    try:
+        return await client.get(f"/api/profiles/{profile_id}/alerts", params=params)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_scores(profile_id: int = 1) -> Any:
+    """Get per-directory security scores for a profile.
+
+    Returns a list of {directoryId, score} reflecting the AD security posture
+    (higher is better; scores reflect outstanding IoE deviances).
+
+    Args:
+        profile_id: Security profile id (default 1).
+    """
+    client = get_client()
+    try:
+        return await client.get(f"/api/profiles/{profile_id}/scores")
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_topology(profile_id: int = 1) -> Any:
+    """Get the Active Directory topology (domains, forests, and trust relationships).
+
+    Args:
+        profile_id: Security profile id (default 1).
+    """
+    client = get_client()
+    try:
+        return await client.get(f"/api/profiles/{profile_id}/topology")
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_search_events(
+    directory_ids: list[int],
+    date_start: str,
+    date_end: str,
+    profile_id: int = 1,
+    expression: dict[str, Any] | None = None,
+    order: dict[str, Any] | None = None,
+) -> Any:
+    """Search AD security events within a date range.
+
+    Args:
+        directory_ids: One or more directory ids to search (see resource="directories").
+        date_start: ISO 8601 start of range, e.g. "2026-07-01T00:00:00.000Z".
+        date_end: ISO 8601 end of range.
+        profile_id: Security profile id (default 1).
+        expression: Optional filter expression object. Defaults to {} (no filter).
+        order: Optional ordering object, e.g. {"column": "date", "direction": "desc"}.
+    """
+    client = get_client()
+    body: dict[str, Any] = {
+        "profileId": profile_id,
+        "directoryIds": directory_ids,
+        "dateStart": date_start,
+        "dateEnd": date_end,
+        "expression": expression if expression is not None else {},
+    }
+    if order is not None:
+        body["order"] = order
+    try:
+        return await client.post("/api/events/search", json=body)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_whoami() -> Any:
+    """Get the current user's identity, roles, and permissions (from the API key)."""
+    client = get_client()
+    try:
+        return await client.get("/api/users/whoami")
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_search_ad_objects(
+    query: str,
+    directory_id: int | None = None,
+    object_type: str | None = None,
+    page: int = 1,
+    per_page: int = 50,
+) -> Any:
+    """Search Active Directory objects (users, computers, groups, OUs) by name or attribute.
+
+    Args:
+        query: Search string to match against AD object names/attributes.
+        directory_id: Restrict search to a specific directory.
+        object_type: Filter by object type: "user", "computer", "group", "ou".
+        page: Page number (1-based).
+        per_page: Results per page.
+    """
+    client = get_client()
+    params: dict[str, Any] = {"search": query, "page": page, "perPage": per_page}
+    if directory_id is not None:
+        params["directoryId"] = directory_id
+    if object_type is not None:
+        params["type"] = object_type
+    try:
+        return await client.get("/api/ad-objects", params=params)
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_profiles() -> Any:
+    """List security profiles (id + name).
+
+    IoE/IoA data is scoped to a profile. The console has a *selected* profile that
+    the API does not expose, so pass the right profile_id explicitly to other tools.
+    """
+    client = get_client()
+    try:
+        data = await client.get("/api/profiles")
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+    if isinstance(data, list):
+        return [
+            {"id": p.get("id"), "name": p.get("name"), "deleted": p.get("deleted", False)}
+            for p in data
+            if isinstance(p, dict)
+        ]
+    return data
+
+
+@mcp.tool()
+async def tie_recent_activity(
+    hours: float = 12,
+    profile_id: int = 1,
+    include_ioe: bool = True,
+    include_ioa: bool = True,
+    directory_ids: list[int] | None = None,
+    max_items: int = 50,
+    verbose: bool = False,
+) -> Any:
+    """Unified recent-activity timeline of IoE alerts and IoA attacks in one call.
+
+    Answers questions like "show me IoE/IoA in the last 12 hours". IoE is sourced
+    from the profile's alert feed (time-ordered) and each in-window alert is
+    enriched with its deviance detail (checker + rendered description). IoA is
+    sourced from the attacks endpoint per directory. Results are merged and sorted
+    newest-first. All timestamps are UTC.
+
+    Args:
+        hours: Look-back window in hours (default 12).
+        profile_id: Security profile id (default 1). See tie_profiles.
+        include_ioe: Include IoE deviance alerts (default True).
+        include_ioa: Include IoA attacks (default True).
+        directory_ids: Restrict to these directory ids (default: all in scope).
+        max_items: Cap on enriched items per category (default 50); truncation is reported.
+        verbose: If False (default), attribute values are slimmed.
+    """
+    client = get_client()
+    start, end = resolve_window(hours=hours)
+    window = {"start": iso_utc(start), "end": iso_utc(end), "timezone": "UTC"}
+
+    # Resolve directories once (used for IoA scoping and IoE filtering).
+    dirs = directory_ids
+    if dirs is None:
+        try:
+            listing = await client.get("/api/directories")
+            dirs = [d["id"] for d in listing if isinstance(d, dict) and "id" in d]
+        except TIEApiError as exc:
+            return {"error": f"could not resolve directories: {exc}", "status": exc.status}
+    dir_filter = set(dirs) if directory_ids is not None else None
+
+    items: list[dict[str, Any]] = []
+    notes: list[str] = []
+
+    # ---- IoE: page the alert feed (newest-first) until older than the window ----
+    if include_ioe:
+        ioe_count = 0
+        truncated = False
+        page = 1
+        done = False
+        while not done and page <= 20:
+            try:
+                alerts = await client.get(
+                    f"/api/profiles/{profile_id}/alerts",
+                    params={"page": page, "perPage": 50},
+                )
+            except TIEApiError as exc:
+                notes.append(f"IoE alerts error: {exc}")
+                break
+            if not isinstance(alerts, list) or not alerts:
+                break
+            for a in alerts:
+                adate = a.get("date")
+                if not adate:
+                    continue
+                when = parse_iso(adate)
+                if when < start:
+                    done = True
+                    break
+                if when > end:
+                    continue
+                if dir_filter is not None and a.get("directoryId") not in dir_filter:
+                    continue
+                if ioe_count >= max_items:
+                    truncated = True
+                    done = True
+                    break
+                entry: dict[str, Any] = {
+                    "kind": "ioe",
+                    "date": adate,
+                    "alertId": a.get("id"),
+                    "devianceId": a.get("devianceId"),
+                    "directoryId": a.get("directoryId"),
+                    "read": a.get("read"),
+                }
+                # Enrich with deviance detail (checker + rendered description).
+                infra_id, dev_id = a.get("infrastructureId"), a.get("devianceId")
+                dir_id = a.get("directoryId")
+                if infra_id and dir_id and dev_id:
+                    try:
+                        dev = await client.get(
+                            f"/api/infrastructures/{infra_id}/directories/{dir_id}/deviances/{dev_id}"
+                        )
+                        if isinstance(dev, dict):
+                            entry["checkerId"] = dev.get("checkerId")
+                            entry["eventDate"] = dev.get("eventDate")
+                            entry["description"] = render_description(dev) or dev.get("description")
+                            if verbose:
+                                entry["deviance"] = slim_object(dev, verbose)
+                    except TIEApiError:
+                        pass
+                items.append(entry)
+                ioe_count += 1
+            page += 1
+        if truncated:
+            notes.append(f"IoE truncated at max_items={max_items}; increase it or narrow the window.")
+
+    # ---- IoA: attacks per directory within the window ----
+    if include_ioa:
+        for did in dirs:
+            try:
+                attacks = await client.get(
+                    f"/api/profiles/{profile_id}/attacks",
+                    params={
+                        "resourceType": "directory",
+                        "resourceValue": str(did),
+                        "dateStart": iso_utc(start),
+                        "dateEnd": iso_utc(end),
+                        "includeClosed": "true",
+                        "limit": max_items,
+                        "order": "desc",
+                    },
+                )
+            except TIEApiError as exc:
+                notes.append(f"IoA error for directory {did}: {exc}")
+                continue
+            if not isinstance(attacks, list):
+                continue
+            for atk in attacks:
+                if not isinstance(atk, dict):
+                    continue
+                items.append({
+                    "kind": "ioa",
+                    "date": atk.get("date"),
+                    "attackId": atk.get("id"),
+                    "attackTypeId": atk.get("attackTypeId"),
+                    "directoryId": atk.get("directoryId"),
+                    "source": atk.get("source"),
+                    "destination": atk.get("destination"),
+                })
+
+    items.sort(key=lambda x: x.get("date") or "", reverse=True)
+
+    return {
+        "window": window,
+        "profileId": profile_id,
+        "counts": {
+            "total": len(items),
+            "ioe": sum(1 for i in items if i["kind"] == "ioe"),
+            "ioa": sum(1 for i in items if i["kind"] == "ioa"),
+        },
+        "notes": notes,
+        "items": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Tenable Identity Exposure MCP Server")
+    parser.add_argument("--transport", choices=["stdio", "sse", "http"], default="stdio")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--tie-url", default=None, help="TIE base URL (or set TIE_URL)")
+    parser.add_argument("--tie-api-key", default=None, help="TIE API key (or set TIE_API_KEY)")
+    parser.add_argument("--no-verify-ssl", action="store_true", default=False)
+    args = parser.parse_args()
+
+    # CRITICAL: on stdio transport, stdout carries the JSON-RPC protocol.
+    # All logging MUST go to stderr or it corrupts the stream.
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
+
+    global _client
+    try:
+        config = TIEConfig(
+            base_url=args.tie_url,
+            api_key=args.tie_api_key,
+            verify_ssl=not args.no_verify_ssl,
+        )
+        _client = TIEClient(config)
+        log.info("tie_client_ready", base_url=config.base_url)
+    except TIEConfigError as exc:
+        log.error("tie_config_error", error=str(exc))
+        sys.exit(1)
+
+    match args.transport:
+        case "stdio":
+            mcp.run(transport="stdio")
+        case "sse":
+            mcp.run(transport="sse", host=args.host, port=args.port)
+        case "http":
+            mcp.run(transport="streamable-http", host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+services:
+  tenable-tie-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TIE_URL=${TIE_URL}
+      - TIE_API_KEY=${TIE_API_KEY}
+      - TIE_VERIFY_SSL=${TIE_VERIFY_SSL:-true}
+    restart: unless-stopped
