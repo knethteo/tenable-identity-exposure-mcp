@@ -42,7 +42,7 @@ NESTED_ENDPOINTS: dict[str, str] = {
     "attacks":             "GET  /api/profiles/{profileId}/attacks   (requires resourceType + resourceValue)  -> use tie_attacks",
     "deviances (checker)": "POST /api/profiles/{profileId}/checkers/{checkerId}/deviances                     -> use tie_deviances_by_checker",
     "deviances (dir)":     "GET  /api/infrastructures/{infraId}/directories/{dirId}/deviances                 -> use tie_deviances_by_directory",
-    "deviances (changed)": "GET  /api/deviances/changed   (incremental, since an event id)                    -> use tie_request",
+    "deviances (changed)": "GET  /api/deviances/changed   (bulk cursor-paginated stream)                      -> use tie_deviances_bulk",
     "alerts (list)":       "GET  /api/profiles/{profileId}/alerts                                             -> use tie_alerts",
     "alerts (single)":     "GET/PATCH /api/alerts/{id}                                                        -> use tie_request",
     "scores":              "GET  /api/profiles/{profileId}/scores                                             -> use tie_scores",

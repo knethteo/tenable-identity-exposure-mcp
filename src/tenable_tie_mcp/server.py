@@ -21,6 +21,9 @@ mcp = FastMCP(
     instructions=(
         "Direct MCP interface for Tenable Identity Exposure (TIE). "
         "Use tie_catalog to discover available resources. "
+        "For remediation-plan workflows: use tie_checkers_summary (compact checker list, "
+        "no description blobs) + tie_deviances_bulk (all active deviances in 1-5 calls) "
+        "instead of tie_resource_action resource='checkers' + per-checker fan-out. "
         "Use tie_request for raw API calls or tie_resource_action for CRUD operations. "
         "All API permissions are enforced by the configured API key."
     ),
@@ -453,6 +456,106 @@ async def tie_search_ad_objects(
         return await client.get("/api/ad-objects", params=params)
     except TIEApiError as exc:
         return {"error": str(exc), "status": exc.status}
+
+
+@mcp.tool()
+async def tie_checkers_summary() -> Any:
+    """Get all IoE checker definitions — essential fields only, no description blobs.
+
+    Returns id, codename, name, categoryId, and remediationCost for every checker.
+    This is ~100x smaller than tie_resource_action resource="checkers", which embeds
+    multi-KB description/recommendation/vulnerabilityDetail blobs per checker (~500 KB
+    total for ~64 checkers). Use this to enumerate checkers, build a remediation plan,
+    or map deviance checkerId values to human-readable names.
+
+    Note: TIE checkers carry remediationCost (easy/medium/hard) but no native severity/
+    criticality score. For AES (Asset Exposure Score) or ACR (Asset Criticality Rating)
+    scoring, connect to Tenable One — see the README for details.
+    """
+    client = get_client()
+    _KEEP = {"id", "codename", "name", "categoryId", "remediationCost", "enabled"}
+    try:
+        data = await client.get("/api/checkers")
+    except TIEApiError as exc:
+        return {"error": str(exc), "status": exc.status}
+    if not isinstance(data, list):
+        return data
+    return [
+        {k: v for k, v in c.items() if k in _KEEP}
+        for c in data
+        if isinstance(c, dict)
+    ]
+
+
+@mcp.tool()
+async def tie_deviances_bulk(
+    profile_id: int | None = None,
+    resolved: bool = False,
+    batch_size: int = 200,
+    max_batches: int = 20,
+) -> Any:
+    """Fetch all IoE deviances in a few paginated calls (bulk alternative to per-checker fan-out).
+
+    Uses GET /api/deviances/changed with cursor pagination to pull deviances across all
+    checkers at once — typically 1–5 API calls instead of one call per checker (~64).
+    This is the recommended starting point for remediation-plan workflows.
+
+    Deviances include checkerId and adObjectId (numeric ID, not display name).
+    Use tie_checkers_summary to map checkerId → checker name, and tie_search_ad_objects
+    to resolve adObjectId → object name if needed.
+
+    Args:
+        profile_id: Filter to a specific profile id (client-side). None = include all profiles.
+        resolved: Include resolved/closed deviances (default False = active only).
+        batch_size: Records per API page (default 200).
+        max_batches: Safety cap on pagination loops (default 20 = up to 4000 records).
+    """
+    client = get_client()
+    all_deviances: list[Any] = []
+    last_id: int | None = None
+    truncated = False
+
+    for _ in range(max_batches):
+        params: dict[str, Any] = {"batchSize": batch_size}
+        if last_id is not None:
+            params["lastIdentifierSeen"] = last_id
+        if not resolved:
+            params["resolved"] = "false"
+
+        try:
+            raw_page = await client.get("/api/deviances/changed", params=params)
+        except TIEApiError as exc:
+            return {"error": str(exc), "status": exc.status}
+
+        if not isinstance(raw_page, list) or not raw_page:
+            break
+
+        raw_count = len(raw_page)
+
+        # Advance cursor to the highest id seen in this page.
+        ids = [d.get("id") for d in raw_page if isinstance(d, dict) and d.get("id") is not None]
+        if ids:
+            last_id = max(ids)
+
+        if profile_id is not None:
+            raw_page = [d for d in raw_page if isinstance(d, dict) and d.get("profileId") == profile_id]
+
+        all_deviances.extend(raw_page)
+
+        if raw_count < batch_size:
+            break
+    else:
+        truncated = True
+
+    result: dict[str, Any] = {
+        "count": len(all_deviances),
+        "profileId": profile_id,
+        "resolved": resolved,
+        "deviances": all_deviances,
+    }
+    if truncated:
+        result["note"] = f"Truncated at max_batches={max_batches}; increase it or use lastIdentifierSeen={last_id} to continue."
+    return result
 
 
 @mcp.tool()

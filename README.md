@@ -151,3 +151,10 @@ docker compose up --build   # reads TIE_URL / TIE_API_KEY from environment
   and `resource_value` is the id or name/ip.
 - Non-JSON responses are returned as `{"content_type": ..., "text": ...}` rather
   than crashing.
+- **Scoring and prioritization:** TIE checkers carry a `remediationCost` (easy / medium /
+  hard) but no native asset-level severity score. If your workflow requires
+  **AES (Asset Exposure Score)** or **ACR (Asset Criticality Rating)** — for example,
+  to rank affected identities by business risk — connect your environment to
+  [Tenable One](https://www.tenable.com/products/tenable-one). Tenable One aggregates
+  data across TIE, Tenable Vulnerability Management, and other sources to produce
+  unified AES/ACR scores that can be surfaced here via the API.
