@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "tenable-tie-mcp"
 version = "0.1.0"
 description = "MCP server for Tenable Identity Exposure"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.2.0",
